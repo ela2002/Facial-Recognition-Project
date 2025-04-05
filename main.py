@@ -14,6 +14,12 @@ from sklearn.metrics import accuracy_score, confusion_matrix, classification_rep
 from skimage.feature import hog
 from skimage import color
 from sklearn.cluster import KMeans
+from sklearn.preprocessing import label_binarize
+from sklearn.metrics import roc_curve, auc
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import precision_recall_curve, average_precision_score
+
 
 # -----------------------------
 # 🔹 Logging Setup
@@ -199,32 +205,115 @@ def plot_confusion_matrix(y_true, y_pred, model_name):
     plt.ylabel('True Labels')
     plt.show()
 
+def plot_accuracy_bar(svm_acc, knn_acc, combined_acc):
+    models = ['SVM', 'KNN', 'Combined']
+    accuracies = [svm_acc, knn_acc, combined_acc]
+
+    plt.figure(figsize=(6, 4))
+    sns.barplot(x=models, y=accuracies, palette="viridis")
+    plt.ylabel('Accuracy')
+    plt.ylim(0, 1)
+    plt.title('Accuracy Comparison')
+    for i, acc in enumerate(accuracies):
+        plt.text(i, acc + 0.01, f"{acc*100:.2f}%", ha='center')
+    plt.grid(True, axis='y')
+    plt.show()
+
+
+def plot_roc_curve_multiclass(X_test, y_test, model, n_classes):
+    y_test_bin = label_binarize(y_test, classes=np.arange(1, n_classes + 1))
+
+    classifier = OneVsRestClassifier(model)
+    classifier.fit(X_test, y_test_bin)
+    y_score = classifier.decision_function(X_test)
+
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = roc_curve(y_test_bin[:, i], y_score[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+
+    # Plot average ROC
+    plt.figure(figsize=(8, 6))
+    for i in range(n_classes):
+        if i % 25 == 0:  # avoid overplotting
+            plt.plot(fpr[i], tpr[i], label=f'Class {i + 1} (AUC = {roc_auc[i]:.2f})')
+
+    plt.plot([0, 1], [0, 1], 'k--', label="Random")
+    plt.title("Multi-class ROC Curve")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.legend(loc='best')
+    plt.grid()
+    plt.show()
+
+
+def plot_precision_recall_curve(X_test, y_test, model, n_classes):
+    y_test_bin = label_binarize(y_test, classes=np.arange(1, n_classes + 1))
+
+    classifier = OneVsRestClassifier(model)
+    classifier.fit(X_test, y_test_bin)
+    y_score = classifier.decision_function(X_test)
+
+    precision = dict()
+    recall = dict()
+    average_precision = dict()
+
+    for i in range(n_classes):
+        precision[i], recall[i], _ = precision_recall_curve(y_test_bin[:, i], y_score[:, i])
+        average_precision[i] = average_precision_score(y_test_bin[:, i], y_score[:, i])
+
+    plt.figure(figsize=(8, 6))
+    for i in range(n_classes):
+        if i % 25 == 0:
+            plt.plot(recall[i], precision[i], lw=2, label=f'Class {i+1} (AP={average_precision[i]:.2f})')
+
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Multi-class Precision-Recall Curve")
+    plt.legend(loc='best')
+    plt.grid()
+    plt.show()
+
+def compute_eer(y_true_bin, y_scores):
+    fpr, tpr, thresholds = roc_curve(y_true_bin, y_scores)
+    fnr = 1 - tpr
+    eer_threshold = thresholds[np.nanargmin(np.absolute((fnr - fpr)))]
+    eer = fpr[np.nanargmin(np.absolute((fnr - fpr)))]
+
+    plt.figure()
+    plt.plot(fpr, label='FPR')
+    plt.plot(fnr, label='FNR')
+    plt.axvline(np.nanargmin(np.absolute(fnr - fpr)), linestyle='--', color='red', label=f'EER = {eer:.2f}')
+    plt.title("Equal Error Rate (EER)")
+    plt.xlabel("Threshold Index")
+    plt.ylabel("Rate")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    return eer, eer_threshold
+
 # -----------------------------
 # 🔹 Step 4: Train & Evaluate Classifiers
 # -----------------------------
-def train_and_evaluate_classifiers(X_train, y_train, X_test, y_test, pca, scaler, images):
+def train_and_evaluate_classifiers(X_train, y_train, X_test, y_test, pca, scaler, images, y_test_filtered):
     logging.info("Training classifiers...")
 
-    # SVM Classifier
-    svm = SVC(kernel="rbf", C=10, gamma="scale")
+    svm = SVC(kernel="rbf", C=10, gamma="scale", probability=True, decision_function_shape="ovr")
     svm.fit(X_train, y_train)
     svm_pred = svm.predict(X_test)
+    svm_scores = svm.decision_function(X_test)  # Multi-class scores
 
-    # KNN Classifier
     knn = KNeighborsClassifier(n_neighbors=5, metric="euclidean")
     knn.fit(X_train, y_train)
     knn_pred = knn.predict(X_test)
+    knn_scores = knn.predict_proba(X_test)  # Optional
 
-    # Combine Predictions
     combined_pred = mode([svm_pred, knn_pred], axis=0)[0].flatten()
 
-
-    # Confusion Matrix
-    plot_confusion_matrix(y_test, svm_pred, "SVM")
-    plot_confusion_matrix(y_test, knn_pred, "KNN")
-    plot_confusion_matrix(y_test, combined_pred, "Combined (SVM + KNN)")
-
-    # Compute and log accuracies
     svm_acc = accuracy_score(y_test, svm_pred)
     knn_acc = accuracy_score(y_test, knn_pred)
     combined_acc = accuracy_score(y_test, combined_pred)
@@ -233,13 +322,18 @@ def train_and_evaluate_classifiers(X_train, y_train, X_test, y_test, pca, scaler
     logging.info(f"KNN Accuracy: {knn_acc * 100:.2f}%")
     logging.info(f"Combined Model Accuracy: {combined_acc * 100:.2f}%")
 
-    # Classification Report
-    logging.info("Classification Report:")
     print(classification_report(y_test, combined_pred))
-
-    # Visualize Predictions
     visualize_predicted_images(images, y_test, combined_pred)
+    plot_accuracy_bar(svm_acc, knn_acc, combined_acc)
 
+    plot_roc_curve_multiclass(X_test, y_test_filtered, svm, n_classes=len(np.unique(y_test_filtered)))
+    plot_precision_recall_curve(X_test, y_test_filtered, svm, n_classes=len(np.unique(y_test_filtered)))
+
+    # Binary classification EER (use last person as positive class)
+    binary_labels = (y_test_filtered == np.unique(y_test_filtered)[-1]).astype(int)
+    binary_scores = svm.decision_function(X_test)[:, -1]
+    eer, _ = compute_eer(binary_labels, binary_scores)
+    logging.info(f"Equal Error Rate (EER - SVM): {eer:.2f}")
 
 # -----------------------------
 # 🔹 Step 5: Main Pipeline
@@ -277,7 +371,8 @@ def main():
     plot_pca_2d(X_train_pca, y_train_filtered)
 
     # Train and Evaluate
-    train_and_evaluate_classifiers(X_train_pca, y_train_filtered, X_test_pca, y_test_filtered, pca, scaler, X_test[valid_test])
+    train_and_evaluate_classifiers(X_train_pca, y_train_filtered, X_test_pca, y_test_filtered, pca, scaler,
+                                   X_test[valid_test], y_test_filtered)
 
 
 if __name__ == "__main__":
